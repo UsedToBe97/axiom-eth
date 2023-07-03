@@ -473,7 +473,7 @@ mod circuit_builder {
             q_lookup: &[Option<Selector>],
             rlc: &RlcConfig<F>,
             layouter: &mut impl Layouter<F>,
-        ) {
+        ) -> HashMap<(usize, usize), (circuit::Cell, usize)> {
             let mut first_pass = SKIP_FIRST_PASS;
             #[cfg(feature = "halo2-axiom")]
             let witness_gen_only = self.builder.borrow().witness_gen_only();
@@ -487,6 +487,7 @@ mod circuit_builder {
                 // in these cases, synthesize is called twice, and challenge can be gotten after the first time, or we use dummy value 0
                 layouter.get_challenge(rlc.gamma).map(|gamma_| gamma = Some(gamma_));
             }
+            let mut assigned_advices = HashMap::new();
 
             layouter
                 .assign_region(
@@ -506,11 +507,17 @@ mod circuit_builder {
                             // call the actual synthesize function
                             let rlc_chip = RlcChip::new(gamma.unwrap_or_else(|| F::zero()));
                             f(&mut builder, &rlc_chip);
-                            let KeygenAssignments {
-                                assigned_advices: _,
-                                assigned_constants: _,
-                                break_points,
-                            } = builder.assign_all(
+                            // let KeygenAssignments {
+                            //     assigned_advices: _,
+                            //     assigned_constants: _,
+                            //     break_points,
+                            // } 
+                            // let mut assignment = KeygenAssignments {
+                            //     assigned_advices: _,
+                            //     assigned_constants: _,
+                            //     break_points,
+                            // } 
+                            let assignments = builder.assign_all(
                                 gate,
                                 lookup_advice,
                                 q_lookup,
@@ -518,7 +525,8 @@ mod circuit_builder {
                                 &mut region,
                                 Default::default(),
                             );
-                            *self.break_points.borrow_mut() = break_points;
+                            *self.break_points.borrow_mut() = assignments.break_points;
+                            assigned_advices = assignments.assigned_advices;
                         } else {
                             let builder = &mut self.builder.borrow_mut();
                             let break_points = &mut self.break_points.borrow_mut();
@@ -559,6 +567,7 @@ mod circuit_builder {
                     },
                 )
                 .unwrap();
+                assigned_advices
         }
     }
 
