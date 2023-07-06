@@ -84,6 +84,8 @@ impl EthBlockHeaderChainFinalAggregationCircuit {
         let mut builder = RlcThreadBuilder {
             threads_rlc: Vec::new(),
             gate_builder: aggregation.inner.circuit.0.builder.take(),
+            vec_rlc_to_lookup:vec![],
+            vec_rlc_hash_table:vec![]
         };
         // TODO: should reuse RangeChip from aggregation circuit, but can't refactor right now
         let range = RangeChip::<Fr>::default(lookup_bits);

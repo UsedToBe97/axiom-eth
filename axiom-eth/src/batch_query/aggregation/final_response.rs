@@ -217,7 +217,7 @@ impl FinalResponseAssemblyCircuit {
         );
 
         // All computations are contained in the `aggregations`'s builder, so we take that to create a new RlcThreadBuilder
-        let builder = RlcThreadBuilder { threads_rlc: Vec::new(), gate_builder };
+        let builder = RlcThreadBuilder { threads_rlc: Vec::new(), gate_builder, vec_rlc_to_lookup: vec![], vec_rlc_hash_table: vec![]};
         let mut assigned_instances = aggregation.inner.assigned_instances;
 
         // add new public instances

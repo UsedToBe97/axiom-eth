@@ -7,9 +7,9 @@ use halo2_base::{
     },
     utils::{bit_length, ScalarField},
     AssignedValue, Context,
-    QuantumCell::{Constant, Existing},
+    QuantumCell::{Constant, Existing}, halo2_proofs::{poly::Rotation, plonk::{SecondPhase, Column, Advice, Selector}},
 };
-use std::iter;
+use std::{iter, marker::PhantomData};
 
 pub mod builder;
 pub mod rlc;
@@ -18,7 +18,39 @@ mod tests;
 
 use rlc::{RlcChip, RlcConfig, RlcTrace};
 
-use self::rlc::RlcContextPair;
+use self::{rlc::RlcContextPair, builder::RlcThreadBuilder};
+
+#[derive(Clone, Debug)]
+pub struct HashTuple<F:ScalarField>(pub AssignedValue<F>, pub AssignedValue<F>, pub AssignedValue<F>);
+
+#[derive(Clone, Debug)]
+pub struct MPTWitness<F: ScalarField> {
+    pub root_0: AssignedValue<F>,
+    pub root_1: AssignedValue<F>,
+    pub leaf_0_w_conts: AssignedValue<F>,
+    pub leaf_1: AssignedValue<F>,
+
+    pub vec_to_lookup: Vec<HashTuple<F>>,
+    pub vec_hash_table: Vec<HashTuple<F>>,
+    pub vec_selector: Vec<AssignedValue<F>>
+
+    // pub (h_vec_0[0], h_vec_1[0], h0_modified, h1_last)
+    // pub t_vec_0: Vec<u8>,
+    // pub id_0: Vec<u8>,
+    // pub pos_vec_0: Vec<u8>,
+    // pub h_vec_0: Vec<String>,
+    // pub g_vec_0: Vec<String>,
+    // pub len_0: usize,
+
+    // pub t_vec_1: Vec<u8>,
+    // pub id_1: Vec<u8>,
+    // pub pos_vec_1: Vec<u8>,
+    // pub h_vec_1: Vec<String>,
+    // pub g_vec_1: Vec<String>,
+    // pub len_1: usize
+
+    // ScalarField element, but easier to deserialize as a string
+}
 
 pub fn max_rlp_len_len(max_len: usize) -> usize {
     if max_len > 55 {
@@ -126,6 +158,83 @@ pub struct RlpFieldTrace<F: ScalarField> {
     // pub rlp_trace: RlcTrace<F>,
 }
 
+/// Configuration for Range Chip
+#[derive(Clone, Debug)]
+pub struct HashConfig<F: ScalarField> {
+    /// Special advice (witness) Columns used only for lookup tables.
+    ///
+    /// Each phase of a halo2 circuit has a distinct lookup_advice column.
+    ///
+    /// * If `gate` has only 1 advice column, lookups are enabled for that column, in which case `lookup_advice` is empty
+    /// * If `gate` has more than 1 advice column some number of user-specified `lookup_advice` columns are added
+    ///     * In this case, we don't need a selector so `q_lookup` is empty
+    pub lookup_advice: Vec<Column<Advice>>,
+    /// Selector values for the lookup table.
+    pub q_lookup: Vec<Option<Selector>>,
+    /// Column for lookup table values.
+    pub lookup: Column<Advice>, // TODO: this lookup should contain all the lookup table hashes
+    pub _pd: PhantomData<F>,
+}
+
+impl<F: ScalarField> HashConfig<F> {
+    /// Generates a new [HashConfig] with the specified parameters.
+    ///
+    /// If `num_columns` is 0, then we assume you do not want to perform any lookups in that phase.
+    ///
+    /// Panics if `lookup_bits` > 28.
+    /// * `meta`: [ConstraintSystem] of the circuit
+    /// * `range_strategy`: [GateStrategy] of the range chip
+    /// * `num_advice`: Number of [Advice] [Column]s without lookup enabled in each phase
+    /// * `num_lookup_advice`: Number of `lookup_advice` [Column]s in each phase
+    /// * `num_fixed`: Number of fixed [Column]s in each phase
+    /// * `lookup_bits`: Number of bits represented in the LookUp table [0,2^lookup_bits)
+    /// * `circuit_degree`: Degree that expresses the size of circuit (i.e., 2^<sup>circuit_degree</sup> is the number of rows in the circuit)
+    pub fn configure(
+        meta: &mut ConstraintSystem<F>,
+        // range_strategy: RangeStrategy,
+        // num_advice: &[usize],
+        // num_lookup_advice: &[usize],
+        num_columns: usize,
+        // num_fixed: usize,
+        // lookup_bits: usize,
+        // params.k()
+        circuit_degree: usize,
+    ) -> Self {
+        let lookup = meta.advice_column_in(SecondPhase);
+
+        // For now, we apply the same range lookup table to each phase
+        let mut q_lookup = Vec::new();
+        let mut lookup_advice = Vec::new();
+        
+        for _ in 0..num_columns {
+            let a = meta.advice_column_in(SecondPhase);
+            meta.enable_equality(a);
+            lookup_advice.push(a);
+        }
+
+        let _pd = PhantomData;
+
+        let mut config =
+            Self { lookup_advice, q_lookup, lookup, _pd};
+
+        // sanity check: only create lookup table if there are lookup_advice columns
+        config.create_lookup(meta);
+
+        config
+    }
+
+    fn create_lookup(&self, meta: &mut ConstraintSystem<F>) {
+        for i in 0..self.lookup_advice.len() {
+            meta.lookup_any("lookup hash", |meta| {
+                let a =
+                    meta.query_advice(self.lookup_advice[i], Rotation::cur());
+                let b = meta.query_advice(self.lookup, Rotation::cur());
+                vec![(a, b)]
+            });
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct RlpArrayTraceWitness<F: ScalarField> {
     pub field_witness: Vec<RlpFieldWitness<F>>,
@@ -180,6 +289,41 @@ impl<F: ScalarField> RlpConfig<F> {
         // blinding factors may have changed
         range.gate.max_rows = (1 << circuit_degree) - meta.minimum_rows();
         Self { rlc, range }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RlpConfig2<F: ScalarField> {
+    pub rlc: RlcConfig<F>,
+    pub range: RangeConfig<F>,
+    pub hash: HashConfig<F>,
+}
+
+impl<F: ScalarField> RlpConfig2<F> {
+    pub fn configure(
+        meta: &mut ConstraintSystem<F>,
+        num_rlc_columns: usize,
+        num_advice: &[usize],
+        num_lookup_advice: &[usize],
+        num_fixed: usize,
+        lookup_bits: usize,
+        circuit_degree: usize,
+    ) -> Self {
+        let mut range = RangeConfig::configure(
+            meta,
+            RangeStrategy::Vertical,
+            num_advice,
+            num_lookup_advice,
+            num_fixed,
+            lookup_bits,
+            circuit_degree,
+        );
+        let rlc = RlcConfig::configure(meta, num_rlc_columns);
+        // blinding factors may have changed
+        range.gate.max_rows = (1 << circuit_degree) - meta.minimum_rows();
+        
+        let mut hash = HashConfig::configure(meta, 1, circuit_degree);
+        Self { rlc, range, hash}
     }
 }
 
@@ -406,6 +550,59 @@ impl<'range, F: ScalarField> RlpChip<'range, F> {
         );
 
         RlpFieldTrace { prefix, prefix_len, len_trace: len_rlc, field_trace: field_rlc }
+    }
+
+    pub fn mpt_func_phase1(
+        &self,
+        builder: &mut RlcThreadBuilder<F>, 
+        // (ctx_gate, ctx_rlc): RlcContextPair<F>,
+        mpt_witness: MPTWitness<F>,
+    ) {
+        let (ctx_gate, ctx_rlc) = builder.rlc_ctx_pair();
+        let MPTWitness {
+            root_0,
+            root_1,
+            leaf_0_w_conts,
+            leaf_1,
+            vec_to_lookup,
+            vec_hash_table,
+            vec_selector
+        } = mpt_witness;
+        let rlc = self.rlc();
+
+        rlc.load_rlc_cache((ctx_gate, ctx_rlc), self.gate(), bit_length(3 as u64));
+
+        // let len_rlc = rlc.compute_rlc((ctx_gate, ctx_rlc), self.gate(), len_cells, len_len);
+        // let field_rlc = rlc.compute_rlc((ctx_gate, ctx_rlc), self.gate(), field_cells, field_len);
+        // let rlp_field_rlc = rlc.compute_rlc((ctx_gate, ctx_rlc), self.gate(), rlp_field, rlp_len);
+        let mut vec_rlc_to_lookup = vec![];
+        let mut vec_rlc_hash_table = vec![];
+
+        for i in 0..vec_hash_table.len() {
+            let rlc_hash_table = rlc.compute_rlc_fixed_len(ctx_rlc, vec![vec_hash_table[i].0, vec_hash_table[i].1, vec_hash_table[i].2]).rlc_val;
+            vec_rlc_hash_table.push(rlc_hash_table);
+        }
+
+        for i in 0..vec_to_lookup.len() {
+            let rlc_to_lookup = rlc.compute_rlc_fixed_len(ctx_rlc, vec![vec_to_lookup[i].0, vec_to_lookup[i].1, vec_to_lookup[i].2]);
+            let value_to_lookup = rlc_to_lookup.rlc_val;
+            let tmp = self.gate().select(ctx_gate, value_to_lookup, vec_rlc_hash_table[0], vec_selector[i]);
+            vec_rlc_to_lookup.push(tmp);
+        }
+
+
+        // for i in 0..vec_rlc_to_lookup.len() {
+        //     let mut res = self.gate().sub(ctx_gate, vec_rlc_to_lookup[i], vec_rlc_hash_table[0]);
+        //     for j in 1..vec_rlc_hash_table.len() {
+        //         let tmp = self.gate().sub(ctx_gate, vec_rlc_to_lookup[i], vec_rlc_hash_table[j]);
+        //         res = self.gate().mul(ctx_gate, res, tmp);
+        //     }
+        //     self.gate().assert_is_const(ctx_gate, &res, &F::from(0));
+        // }  
+
+        builder.vec_rlc_to_lookup = vec_rlc_to_lookup;
+        builder.vec_rlc_hash_table = vec_rlc_hash_table;
+        // RlpFieldTrace { prefix, prefix_len, len_trace: len_rlc, field_trace: field_rlc }
     }
 
     /// Compute and assign witnesses for deserializing an RLP list of byte strings. Does not support nested lists.

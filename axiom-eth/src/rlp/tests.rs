@@ -308,8 +308,33 @@ mod rlp {
         builder::{FnSynthesize, RlcThreadBuilder, RlpCircuitBuilder},
         *,
     };
-    use halo2_base::halo2_proofs::{dev::MockProver, halo2curves::bn256::Fr};
+    use halo2_base::{
+        gates::{
+            builder::{GateCircuitBuilder, GateThreadBuilder},
+            GateChip,
+        },
+        halo2_proofs::{
+            dev::MockProver,
+            halo2curves::bn256::{Bn256, Fr, G1Affine},
+            plonk::{create_proof, keygen_pk, keygen_vk, verify_proof, Error},
+            poly::{
+                commitment::ParamsProver,
+                kzg::{
+                    commitment::{KZGCommitmentScheme, ParamsKZG},
+                    multiopen::{ProverSHPLONK, VerifierSHPLONK},
+                    strategy::SingleStrategy,
+                },
+            },
+            transcript::{
+                Blake2bRead, Blake2bWrite, Challenge255, TranscriptReadBuffer,
+                TranscriptWriterBuffer,
+            },
+        },
+        utils::{bit_length, ScalarField},
+    };
     use hex::FromHex;
+    use rand::rngs::StdRng;
+    use rand_core::SeedableRng;
     use std::env::set_var;
     use test_log::test;
 
@@ -439,5 +464,56 @@ mod rlp {
 
         let circuit = rlp_string_circuit(RlcThreadBuilder::<Fr>::mock(), input_bytes, 60);
         MockProver::run(k, &circuit, vec![]).unwrap().assert_satisfied();
+    }
+
+    #[test]
+    pub fn test_rlp() -> Result<(), Error> {
+        let k = DEGREE;
+        let input_bytes: Vec<u8> = Vec::from_hex("b83adb004d9b1e7f3e5f86fbdc9856f21f9dcb07a44c42f5de8eec178514d279df0000000000000000000000000000000000000000000000000000000000").unwrap();
+
+        let len = 60;
+
+        let mut rng = StdRng::from_seed([0u8; 32]);
+        let params = ParamsKZG::<Bn256>::setup(k, &mut rng);
+        let circuit = rlp_string_circuit(RlcThreadBuilder::keygen(), input_bytes.clone(), len);
+        circuit.config(k as usize, Some(6));
+
+        println!("vk gen started");
+        let vk = keygen_vk(&params, &circuit)?;
+        println!("vk gen done");
+        let pk = keygen_pk(&params, vk, &circuit)?;
+        println!("pk gen done");
+        println!();
+        println!("==============STARTING PROOF GEN===================");
+        let break_points = circuit.break_points();
+        drop(circuit);
+        let circuit = rlp_string_circuit(RlcThreadBuilder::prover(), input_bytes, len);
+        // *circuit.0.break_points.borrow_mut() = break_points;
+        circuit.modify_break_points(break_points);
+
+        let mut transcript = Blake2bWrite::<_, _, Challenge255<_>>::init(vec![]);
+        create_proof::<
+            KZGCommitmentScheme<Bn256>,
+            ProverSHPLONK<'_, Bn256>,
+            Challenge255<G1Affine>,
+            _,
+            Blake2bWrite<Vec<u8>, G1Affine, Challenge255<G1Affine>>,
+            _,
+        >(&params, &pk, &[circuit], &[&[]], rng, &mut transcript)?;
+        let proof = transcript.finalize();
+        println!("proof gen done");
+        let verifier_params = params.verifier_params();
+        let strategy = SingleStrategy::new(verifier_params);
+        let mut transcript = Blake2bRead::<_, _, Challenge255<_>>::init(&proof[..]);
+        verify_proof::<
+            KZGCommitmentScheme<Bn256>,
+            VerifierSHPLONK<'_, Bn256>,
+            Challenge255<G1Affine>,
+            Blake2bRead<&[u8], G1Affine, Challenge255<G1Affine>>,
+            SingleStrategy<'_, Bn256>,
+        >(verifier_params, pk.get_vk(), strategy, &[&[]], &mut transcript)
+        .unwrap();
+        println!("verify done");
+        Ok(())
     }
 }

@@ -18,7 +18,7 @@ use halo2_base::{
         plonk::{Advice, Column, Selector},
     },
     utils::ScalarField,
-    Context,
+    Context, AssignedValue,
 };
 use itertools::Itertools;
 use rayon::prelude::*;
@@ -46,6 +46,9 @@ pub struct RlcThreadBuilder<F: ScalarField> {
     pub threads_rlc: Vec<Context<F>>,
     /// [`GateThreadBuilder`] with threads for basic gate; also in charge of thread IDs
     pub gate_builder: GateThreadBuilder<F>,
+
+    pub vec_rlc_to_lookup: Vec<AssignedValue<F>>,
+    pub vec_rlc_hash_table: Vec<AssignedValue<F>>,
 }
 
 impl<F: ScalarField> RlcThreadBuilder<F> {
@@ -58,7 +61,7 @@ impl<F: ScalarField> RlcThreadBuilder<F> {
         {
             witness_gen_only = false;
         }
-        Self { threads_rlc: Vec::new(), gate_builder: GateThreadBuilder::new(witness_gen_only) }
+        Self { threads_rlc: Vec::new(), gate_builder: GateThreadBuilder::new(witness_gen_only), vec_rlc_to_lookup: vec![], vec_rlc_hash_table: vec![]}
     }
 
     pub fn from_stage(stage: CircuitBuilderStage) -> Self {
@@ -313,6 +316,7 @@ pub fn assign_prover_phase0<F: ScalarField>(
     builder: &mut RlcThreadBuilder<F>,
     break_points: &mut RlcThreadBreakPoints,
 ) {
+    println!("break_points {:?}", break_points);
     let break_points_gate = mem::take(&mut break_points.gate[FIRST_PHASE]);
     // warning: we currently take all contexts from phase 0, which means you can't read the values
     // from these contexts later in phase 1. If we want to read, should clone here
@@ -404,6 +408,7 @@ pub use circuit_builder::*;
 mod circuit_builder {
     use std::cell::RefCell;
 
+    use crate::rlp::RlpConfig2;
     use crate::util::EthConfigParams;
 
     use crate::rlp::{
@@ -411,6 +416,7 @@ mod circuit_builder {
         rlc::{RlcChip, RlcConfig},
         RlcGateConfig, RlpConfig,
     };
+    use halo2_base::AssignedValue;
     use halo2_base::{
         gates::flex_gate::{FlexGateConfig, GateStrategy},
         halo2_proofs::{
@@ -636,6 +642,14 @@ mod circuit_builder {
         pub fn config(&self, k: usize, minimum_rows: Option<usize>) -> EthConfigParams {
             self.0.config(k, minimum_rows)
         }
+
+        pub fn break_points(&self) -> RlcThreadBreakPoints {
+            self.0.break_points.take()
+        }
+
+        pub fn modify_break_points(&self, break_points: RlcThreadBreakPoints) {
+            *self.0.break_points.borrow_mut() = break_points;
+        }
     }
 
     impl<F: ScalarField, FnPhase1> Circuit<F> for RlpCircuitBuilder<F, FnPhase1>
@@ -685,6 +699,157 @@ mod circuit_builder {
                 &config.rlc,
                 &mut layouter,
             );
+            Ok(())
+        }
+    }
+
+
+    /// A wrapper around RlcCircuitBuilder where Gate is replaced by Range in the circuit
+    pub struct RlpCircuitBuilder2<F: ScalarField, FnPhase1>(RlcCircuitBuilder<F, FnPhase1>)
+    where
+        FnPhase1: FnSynthesize<F>;
+
+    impl<F: ScalarField, FnPhase1> RlpCircuitBuilder2<F, FnPhase1>
+    where
+        FnPhase1: FnSynthesize<F>,
+    {
+        pub fn new(
+            builder: RlcThreadBuilder<F>,
+            break_points: Option<RlcThreadBreakPoints>,
+            synthesize_phase1: FnPhase1,
+        ) -> Self {
+            Self(RlcCircuitBuilder::new(builder, break_points, synthesize_phase1))
+        }
+
+        pub fn config(&self, k: usize, minimum_rows: Option<usize>) -> EthConfigParams {
+            self.0.config(k, minimum_rows)
+        }
+
+        pub fn break_points(&self) -> RlcThreadBreakPoints {
+            self.0.break_points.take()
+        }
+
+        pub fn modify_break_points(&self, break_points: RlcThreadBreakPoints) {
+            *self.0.break_points.borrow_mut() = break_points;
+        }
+    }
+
+    impl<F: ScalarField, FnPhase1> Circuit<F> for RlpCircuitBuilder2<F, FnPhase1>
+    where
+        FnPhase1: FnSynthesize<F>,
+    {
+        type Config = RlpConfig2<F>;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            unimplemented!()
+        }
+
+        fn configure(meta: &mut ConstraintSystem<F>) -> RlpConfig2<F> {
+            let EthConfigParams {
+                degree,
+                num_rlc_columns,
+                num_range_advice,
+                num_lookup_advice,
+                num_fixed,
+                unusable_rows: _,
+                keccak_rows_per_round: _,
+                lookup_bits: _,
+            } = serde_json::from_str(&std::env::var("ETH_CONFIG_PARAMS").unwrap()).unwrap();
+            let lookup_bits = std::env::var("LOOKUP_BITS").unwrap().parse().unwrap();
+            RlpConfig2::configure(
+                meta,
+                num_rlc_columns,
+                &num_range_advice,
+                &num_lookup_advice,
+                num_fixed,
+                lookup_bits,
+                degree as usize,
+            )
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<F>,
+        ) -> Result<(), Error> {
+            config.range.load_lookup_table(&mut layouter)?;
+            self.0.two_phase_synthesize(
+                &config.range.gate,
+                &config.range.lookup_advice,
+                &config.range.q_lookup,
+                &config.rlc,
+                &mut layouter,
+            );
+
+            layouter
+                .assign_region(
+                    || "RlcCircuitBuilder generated circuit",
+                    |mut region| {
+                        let mut row_offset = 0;
+                        let vec_rlc_to_lookup = &self.0.builder.borrow().vec_rlc_to_lookup;
+                        // for (i, value) in self.1.iter().enumerate()
+                        for i in 0..vec_rlc_to_lookup.len() {
+                            region.assign_advice(
+                                config.hash.lookup_advice[0],
+                                row_offset,
+                                Value::known(vec_rlc_to_lookup[i].value),
+                            );
+                            row_offset += 1;
+                        }
+                        Ok(())
+                        // region.assign_advice(column, row_offset, Value::known(advice));
+                    }
+                )
+                .unwrap();
+
+            layouter
+                .assign_region(
+                    || "RlcCircuitBuilder generated circuit",
+                    |mut region| {
+                        let mut row_offset = 0;
+                        let vec_rlc_hash_table = &self.0.builder.borrow().vec_rlc_hash_table;
+                        // for (i, value) in self.1.iter().enumerate()
+                        for i in 0..vec_rlc_hash_table.len() {
+                            region.assign_advice(
+                                config.hash.lookup,
+                                row_offset,
+                                Value::known(vec_rlc_hash_table[i].value),
+                            );
+                            row_offset += 1;
+                        }
+                        Ok(())
+                        // region.assign_advice(column, row_offset, Value::known(advice));
+                    }
+                )
+                .unwrap();
+
+            // let (mut column, _) = rlc.basic_gates[gate_index];
+            // let mut row_offset = 0;
+
+            // for ctx in threads_rlc {
+            //     for advice in ctx.advice {
+            //         #[cfg(feature = "halo2-axiom")]
+            //         region.assign_advice(column, row_offset, Value::known(advice));
+            //         #[cfg(not(feature = "halo2-axiom"))]
+            //         region.assign_advice(|| "", column, row_offset, || Value::known(advice)).unwrap();
+
+            //         if break_point == Some(row_offset) {
+            //             break_point = break_points.next();
+            //             row_offset = 0;
+            //             gate_index += 1;
+            //             (column, _) = rlc.basic_gates[gate_index];
+
+            //             #[cfg(feature = "halo2-axiom")]
+            //             region.assign_advice(column, row_offset, Value::known(advice));
+            //             #[cfg(not(feature = "halo2-axiom"))]
+            //             region.assign_advice(|| "", column, row_offset, || Value::known(advice)).unwrap();
+            //         }
+
+            //         row_offset += 1;
+            //     }
+            // }
+
             Ok(())
         }
     }
